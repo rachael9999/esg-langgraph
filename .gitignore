@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv*/
+venv*/
+
+# SQLite
+*.db
+*.sqlite3
+
+# Project specific storage
+storage/
+/tmp/
+
+# VS Code
+.vscode/
+
+# OS specific
+.DS_Store
+Thumbs.db
