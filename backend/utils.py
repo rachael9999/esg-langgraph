@@ -136,24 +136,53 @@ def parse_questionnaire(content: str) -> list[dict]:
                 current_section = "question"
             # 匹配 "- 选项：" 或 "选项："
             elif stripped.startswith("- 选项：") or stripped.startswith("选项："):
+                # options may be inline or followed by bullets
                 current_section = "options"
+                inline = stripped.replace("- 选项：", "").replace("选项：", "").strip()
+                if inline:
+                    # split inline options by common delimiters
+                    parts = re.split(r"[;；,，\n]+", inline)
+                    for p in parts:
+                        p = p.strip()
+                        if p:
+                            options.append(p)
             # 在选项部分，匹配以 - 或 * 开头的行
-            elif current_section == "options" and (stripped.startswith("- ") or stripped.startswith("* ")):
-                opt_text = re.sub(r"^[-*]\s+", "", stripped).strip()
-                if opt_text:
-                    options.append(opt_text)
+            elif (current_section == "options" or (stripped.startswith("- ") or stripped.startswith("* ")) and current_section is None):
+                # treat bullet lines as options if we're in options section or no section specified
+                if stripped.startswith("- ") or stripped.startswith("* "):
+                    opt_text = re.sub(r"^[-*]\s+", "", stripped).strip()
+                    # skip bullets that are actually '问题：' or sub-headers
+                    if opt_text.startswith("问题：") or opt_text.startswith("选项："):
+                        continue
+                    if opt_text:
+                        options.append(opt_text)
             # 如果遇到新的顶级项（虽然 split 已经处理了，但为了保险）
             elif stripped.startswith("- `"):
                 break
 
         if question:
+            # normalize type
+            qt = q_type.strip()
+            norm_type = qt
+            if "多选" in qt or "多项" in qt:
+                norm_type = "多选"
+            elif "单选" in qt or "单项" in qt:
+                norm_type = "单选"
+            elif "数值" in qt or "数字" in qt:
+                norm_type = "数值"
+            elif "百分比" in qt or "%" in qt:
+                norm_type = "百分比"
+            elif "多行" in qt or "多行文本" in qt:
+                norm_type = "文本"
+            elif "文本" in qt or "字符串" in qt:
+                norm_type = "文本"
+
             items.append(
                 {
                     "key": key.strip(),
-                    "type": q_type.strip(),
+                    "type": norm_type,
                     "question": question,
                     "options": options if options else None,
                 }
             )
     return items
-    return output_path

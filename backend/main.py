@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import uuid
+import json
 from pathlib import Path
 from typing import List
 
@@ -294,11 +295,74 @@ async def ask_questions(payload: QuestionRequest) -> QuestionResponse:
     return QuestionResponse(session_id=payload.session_id, answers=answers)
 
 
-@app.post("/parse-readme", response_model=QuestionnaireResponse)
-async def parse_readme_endpoint(payload: ReadmeRequest) -> QuestionnaireResponse:
-    items = parse_questionnaire(payload.content)
-    # We don't have session_id here, but we can save it when the user actually uses it in a session
-    return QuestionnaireResponse(items=items)
+@app.post("questionnaire/parse", response_model=QuestionnaireResponse)
+async def parse_questionnaire_api(file: UploadFile = File(...)) -> QuestionnaireResponse:
+    """
+    Standalone API to convert an attached file (PDF, DOCX, TXT, MD) into a structured ESG questionnaire.
+    Input: Multipart form-data with 'file' field.
+    Output: {"items": [{"key": "...", "type": "...", "question": "...", "options": [...]}, ...]}
+    """
+    content = await file.read()
+    try:
+        parsed = parse_document(file.filename, content)
+        text = "\n".join(page.text for page in parsed.pages)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
+
+    system_prompt = (
+        "你是一个专业的 ESG 问卷解析助手。你的任务是将非结构化的文档内容转换为结构化的 JSON 格式问卷。"
+    )
+
+    user_prompt = (
+        "请解析以下文档内容，并将其转换为一个 JSON 列表。每个对象包含以下字段：\n"
+        "1. `key`: 一个唯一的、描述性的英文键名（如 `env_policy`, `scope1_emissions`）。\n"
+        "2. `type`: 题目类型，必须是以下之一：'单选', '多选', '数值', '百分比', '文本'。\n"
+        "   - 如果题目包含选项列表，通常是 '单选' 或 '多选'。\n"
+        "   - 如果题目询问数值、总量、占比或包含单位（如 kWh, 吨, %），请设为 '数值' 或 '百分比'。\n"
+        "   - 否则设为 '文本'。\n"
+        "3. `question`: 题目文本（去掉前面的数字编号）。\n"
+        "4. `options`: 如果是单选或多选，列出所有选项的列表；否则为 null。\n\n"
+        "待解析内容：\n"
+        f"{text}\n\n"
+        "输出要求：\n"
+        "- 仅输出纯 JSON 列表，不要包含任何 Markdown 代码块标签或解释文字。\n"
+        "- 确保 JSON 格式正确。"
+    )
+
+    try:
+        resp = call_text_llm(user_prompt, system_prompt=system_prompt)
+        resp = resp.strip()
+        if resp.startswith("```json"): resp = resp[7:]
+        if resp.startswith("```"): resp = resp[3:]
+        if resp.endswith("```"): resp = resp[:-3]
+        resp = resp.strip()
+        
+        items = json.loads(resp)
+        if not isinstance(items, list):
+            raise ValueError("LLM did not return a list")
+            
+        return QuestionnaireResponse(items=items)
+    except Exception:
+        # Fallback to regex parser if LLM fails (only works well for MD/TXT)
+        items = parse_questionnaire(text)
+        return QuestionnaireResponse(items=items)
+
+
+@app.post("/session/{session_id}/questionnaire/upload-markdown")
+async def upload_questionnaire_markdown(session_id: str, file: UploadFile = File(...)) -> dict:
+    """
+    Upload a file, parse it, and save it directly to the session.
+    """
+    session = SESSION_STORE.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    # Reuse the parsing logic
+    result = await parse_questionnaire_api(file)
+    
+    session.questionnaire = [item.dict() for item in result.items]
+    SESSION_STORE.save(session_id)
+    return {"items": session.questionnaire}
 
 
 @app.get("/session/{session_id}/questionnaire")
@@ -339,6 +403,20 @@ def get_session_status(session_id: str) -> dict:
         "file_compliance": session.file_compliance,
         "has_vectorstore": session.vectorstore is not None,
     }
+
+
+@app.get("/session/{session_id}/rag-ready")
+def get_rag_ready(session_id: str) -> dict:
+    """Return whether the RAG/vectorstore for the given session is ready.
+
+    Response: {"session_id": str, "rag_ready": bool, "has_vectorstore": bool}
+    """
+    session = SESSION_STORE.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    ready = session.vectorstore is not None
+    return {"session_id": session_id, "rag_ready": ready, "has_vectorstore": ready}
 
 
 @app.put("/session/{session_id}/compliance/{filename}")

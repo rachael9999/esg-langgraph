@@ -26,6 +26,7 @@ class SessionData:
     file_compliance: Dict[str, Dict] = field(default_factory=dict)
     questionnaire: List[Dict[str, Any]] = field(default_factory=list)
     rag_answers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    readme: str = ""
 
 
 class SessionStore:
@@ -238,6 +239,7 @@ class SessionStore:
             "file_compliance": sess.file_compliance,
             "questionnaire": sess.questionnaire,
             "rag_answers": sess.rag_answers,
+            "readme": sess.readme,
         }
         serialized = json.dumps(metadata, ensure_ascii=False)
 
@@ -273,6 +275,7 @@ class SessionStore:
                 file_compliance=metadata.get("file_compliance", {}),
                 questionnaire=metadata.get("questionnaire", []),
                 rag_answers=metadata.get("rag_answers", {}),
+                readme=metadata.get("readme", ""),
             )
 
             storage_path = self._get_storage_path(session_id)

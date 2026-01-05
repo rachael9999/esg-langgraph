@@ -75,8 +75,9 @@ def answer_question(state: RagState) -> RagState:
         
         combined = "\n\n".join(formatted_docs)
         prompt = (
-            "请根据以下多个来源的检索内容回答问题，给出简洁明确的中文答复。\n"
+            "请根据以下多个来源的检索内容回答问题，给出详尽且准确的中文答复。\n"
             "如果不同来源有冲突或补充，请在回答中予以体现。请尽量综合所有来源的信息进行回答。\n"
+            "对于简答题，请提供完整的段落描述；对于选择题，请明确指出选中的选项及其理由。\n"
             f"问题：{state['question']}\n"
             f"检索内容：\n{combined}"
         )
@@ -95,13 +96,19 @@ def answer_question(state: RagState) -> RagState:
 
 def generate_input(state: RagState) -> RagState:
     answer = state.get("answer")
+    question = state.get("question")
     if not answer or answer == "未找到相关内容。":
         return {**state, "extracted_answer": ""}
 
     prompt = (
-        "请从以下回答中提取出最直接的答案（如数值、日期、具体名称等）。\n"
-        "如果是选择题（单选或多选），请严格只返回匹配的可选项文本，多个选项用分号';'分隔。不要包含任何解释、序号或'适用'等字样。\n"
-        f"回答：{answer}"
+        f"原始问题：{question}\n"
+        f"详细回答：{answer}\n\n"
+        "任务：请从“详细回答”中提取出最直接、准确且完整的答案，用于填入表格。\n"
+        "要求：\n"
+        "1. 如果原始问题是选择题（包含 1.xxx 2.xxx 等选项），请务必返回选项对应的完整文本内容。如果回答中只提到了序号（如'1'或'A'），请将其转换为对应的选项文本。多个选项用分号';'分隔。\n"
+        "2. 如果是简答题，请提取出最详尽的相关段落或具体信息，确保答案完整且具有代表性，不要只返回一个词或短语，除非那是唯一的答案。\n"
+        "3. 严禁包含任何解释性文字、序号（除非序号是选项文本的一部分）或引导词（如“答案是：”）。\n"
+        "4. 如果无法从回答中提取出有效答案，请返回空字符串。"
     )
     try:
         extracted = call_text_llm(prompt).strip()

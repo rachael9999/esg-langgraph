@@ -4,6 +4,8 @@ import time
 import re
 
 import requests
+import json
+import math
 import urllib3
 from requests.exceptions import ReadTimeout, ConnectionError, RequestException
 import streamlit as st
@@ -30,6 +32,36 @@ def safe_post(url: str, **kwargs):
         return None, "无法连接到后端 (Connection error)。请确认后端已运行并监听 http://localhost:8000。"
     except RequestException as e:
         return None, f"网络请求失败: {e}"
+
+
+def parse_numeric(val) -> float:
+    """Try to coerce various string/number inputs into a float for number_input.
+
+    Examples handled: '12,500 吨 CO2 当量' -> 12500.0, '35%' -> 35.0, '3.14' -> 3.14
+    """
+    if isinstance(val, (int, float)):
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+    if val is None:
+        return 0.0
+    s = str(val).strip()
+    if not s:
+        return 0.0
+    # remove percent sign but keep number
+    s = s.replace('%', '')
+    # remove common unit words and chinese characters
+    s = re.sub(r"[\s\u4e00-\u9fff,%]+", "", s)
+    # now s should contain digits, maybe with commas or dots
+    s = s.replace(',', '')
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(0))
+    except Exception:
+        return 0.0
 
 
 def build_rag_prompt(item: dict) -> str:
@@ -97,7 +129,11 @@ if st.session_state.pending_rag_fills:
             else:
                 st.session_state[f"ans_{key}"] = val
         else:
-            st.session_state[f"ans_{key}"] = val
+            # For numeric types, ensure the value is a float
+            if "数值" in item["type"] or "百分比" in item["type"]:
+                st.session_state[f"ans_{key}"] = parse_numeric(val)
+            else:
+                st.session_state[f"ans_{key}"] = val
     st.session_state.pending_rag_fills = {}
 
 st.sidebar.title("Session 管理")
@@ -153,32 +189,29 @@ elif not st.session_state.questionnaire:
         st.session_state.rag_answers = {}
 
 st.sidebar.divider()
-st.sidebar.title("README 浏览")
+st.sidebar.title("问卷配置")
 st.sidebar.markdown("**当前 Session ID**")
 st.sidebar.code(st.session_state.session_id)
-readme_file = st.sidebar.file_uploader("上传 README", type=["md", "txt"])
-if readme_file:
-    content = readme_file.read().decode("utf-8", errors="ignore")
-    st.sidebar.text_area("README 内容", content, height=400)
-    if st.sidebar.button("解析为问卷"):
-        with st.spinner("解析中..."):
+q_file = st.sidebar.file_uploader("上传问卷文件 (PDF/DOCX/TXT/MD)", type=["pdf", "docx", "txt", "md"])
+if q_file:
+    if st.sidebar.button("解析并生成问卷"):
+        with st.spinner("正在解析问卷结构..."):
             response, err = safe_post(
-                f"{API_BASE}/parse-readme", json={"content": content}, timeout=30
+                f"{API_BASE}/session/{st.session_state.session_id}/questionnaire/upload-markdown",
+                files={"file": (q_file.name, q_file.getvalue())},
+                timeout=120
             )
             if err:
                 st.sidebar.error(err)
             elif response.ok:
-                st.session_state.questionnaire = response.json().get("items", [])
-                # Save to backend session
-                safe_post(
-                    f"{API_BASE}/session/{st.session_state.session_id}/questionnaire",
-                    json={"items": st.session_state.questionnaire}
-                )
-                st.sidebar.success(f"成功解析 {len(st.session_state.questionnaire)} 个问题")
+                items = response.json().get("items", [])
+                st.session_state.questionnaire = items
+                st.sidebar.success(f"成功解析 {len(items)} 个问题")
+                st.rerun()
             else:
                 st.sidebar.error(f"解析失败: {response.text}")
 else:
-    st.sidebar.info("上传 README 后将显示在这里。")
+    st.sidebar.info("请上传包含问卷内容的文档。")
 
 st.title("ESG 文档问答")
 
@@ -310,7 +343,7 @@ if st.session_state.ask_answers:
                 )
         st.sidebar.divider()
 
-st.subheader("问卷调查 (从 README 解析)")
+st.subheader("问卷调查")
 if st.session_state.questionnaire:
     with st.form("questionnaire_form"):
         for item in st.session_state.questionnaire:
@@ -336,12 +369,57 @@ if st.session_state.questionnaire:
                             unsafe_allow_html=True,
                         )
 
-            if "多选" in q_type and options:
-                st.multiselect(f"选择 ({key})", options, key=f"ans_{key}")
-            elif "数值" in q_type or "百分比" in q_type:
-                st.text_input(f"输入数值/百分比 ({key})", key=f"ans_{key}")
+            # Choose widget based on normalized type
+            state_key = f"ans_{key}"
+            # Ensure default exists in session_state with appropriate type
+            if state_key not in st.session_state:
+                if "多选" in q_type:
+                    default_val = []
+                elif "数值" in q_type or "百分比" in q_type:
+                    default_val = 0.0
+                elif "单选" in q_type:
+                    default_val = options[0] if options else ""
+                else:
+                    default_val = ""
+                st.session_state[state_key] = default_val
+
+            if "多选" in q_type:
+                if options:
+                    default = st.session_state.get(state_key, [])
+                    if not isinstance(default, list):
+                        default = [default] if default else []
+                    st.session_state[state_key] = default
+                    st.multiselect(f"选择 ({key})", options, default=default, key=state_key)
+                else:
+                    # No options provided; allow comma-separated input then parse later
+                    st.text_area(f"多选 - 手动输入选项，逗号分隔 ({key})", key=state_key)
+            elif "单选" in q_type:
+                if options:
+                    default = st.session_state.get(state_key, None)
+                    # attempt to set initial index if default exists
+                    try:
+                        idx = options.index(default) if default in options else 0
+                        st.radio(f"选择 ({key})", options, index=idx, key=state_key)
+                    except Exception:
+                        st.radio(f"选择 ({key})", options, key=state_key)
+                else:
+                    st.text_input(f"单选 - 手动输入 ({key})", key=state_key)
+            elif "百分比" in q_type:
+                # render as number input 0-100
+                val = parse_numeric(st.session_state.get(state_key, 0.0))
+                # Force session state to be float to avoid TypeError with number_input
+                st.session_state[state_key] = val
+                st.number_input(f"百分比 ({key})", min_value=0.0, max_value=100.0, value=val, step=1.0, format="%.1f", key=state_key)
+            elif "数值" in q_type:
+                # render as numeric input; allow floats
+                val = parse_numeric(st.session_state.get(state_key, 0.0))
+                # Force session state to be float to avoid TypeError with number_input
+                st.session_state[state_key] = val
+                st.number_input(f"数值 ({key})", value=val, key=state_key)
             else:
-                st.text_area(f"输入内容 ({key})", key=f"ans_{key}")
+                # 默认文本，多行
+                default = st.session_state.get(state_key, "")
+                st.text_area(f"输入内容 ({key})", value=default, key=state_key)
 
         submit_rag = st.form_submit_button("提交问卷并询问 RAG")
 
@@ -377,4 +455,4 @@ if st.session_state.questionnaire:
         else:
             st.error(f"请求失败: {response.text}")
 else:
-    st.info("暂无解析问卷，先在侧边栏上传 README 并点击 '解析为问卷'。")
+    st.info("暂无解析问卷，请先在侧边栏上传问卷文件并点击 '解析并生成问卷'。")
