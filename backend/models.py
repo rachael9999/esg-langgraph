@@ -8,6 +8,12 @@ class ComplianceResult(BaseModel):
     company_name: str | None = None
     company_name_ok: bool = False
     has_signature_or_seal: bool = False
+    report_type: str | None = None
+    industry: str | None = None
+    company_size: str | None = None
+    region: str | None = None
+    target: str | None = None
+    signature_note: str | None = None
     notes: list[str] = Field(default_factory=list)
 
 

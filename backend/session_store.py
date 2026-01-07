@@ -24,6 +24,7 @@ class SessionData:
     file_contents: Dict[str, bytes] = field(default_factory=dict)
     image_files: Dict[str, bytes] = field(default_factory=dict)
     file_compliance: Dict[str, Dict] = field(default_factory=dict)
+    file_analyses: Dict[str, Dict] = field(default_factory=dict)
     questionnaire: List[Dict[str, Any]] = field(default_factory=list)
     rag_answers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     readme: str = ""
@@ -237,6 +238,7 @@ class SessionStore:
             "files": sess.files,
             "page_summaries": sess.page_summaries,
             "file_compliance": sess.file_compliance,
+            "file_analyses": sess.file_analyses,
             "questionnaire": sess.questionnaire,
             "rag_answers": sess.rag_answers,
             "readme": sess.readme,
@@ -273,6 +275,7 @@ class SessionStore:
                 files=metadata.get("files", []),
                 page_summaries=metadata.get("page_summaries", {}),
                 file_compliance=metadata.get("file_compliance", {}),
+                file_analyses=metadata.get("file_analyses", {}),
                 questionnaire=metadata.get("questionnaire", []),
                 rag_answers=metadata.get("rag_answers", {}),
                 readme=metadata.get("readme", ""),

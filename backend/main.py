@@ -4,7 +4,7 @@ import re
 import uuid
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, BackgroundTasks
 from fastapi import Body, HTTPException
@@ -28,10 +28,18 @@ from .session_store import SESSION_STORE
 from .utils import (
     detect_company_name,
     detect_signature_or_seal,
+    detect_signature_in_pdf,
+    detect_report_type,
+    detect_industry,
+    detect_company_size,
+    detect_region,
+    detect_target,
     is_supported,
     parse_document,
     parse_questionnaire,
     render_pdf_page_to_jpg,
+    get_pdf_page_count,
+    detect_signature_in_image,
 )
 
 app = FastAPI(title="ESG LangGraph Service")
@@ -57,9 +65,9 @@ async def list_sessions() -> List[str]:
 
 @app.post("/upload", response_model=DocumentIngestion)
 async def upload_file(
+    background_tasks: BackgroundTasks,
     session_id: str = Form(...),
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None,
 ) -> DocumentIngestion:
     """Accept file upload and schedule heavy parsing/indexing in background.
 
@@ -68,31 +76,88 @@ async def upload_file(
     """
     content = await file.read()
     # quick format check
-    if not is_supported(file.filename):
+    if not is_supported(file.filename or ""):
         compliance = ComplianceResult(
             is_supported=False,
             notes=["文件格式不支持。"],
         )
         return DocumentIngestion(
-            filename=file.filename,
+            filename=str(file.filename or ""),
             page_summaries=[],
             compliance=compliance,
         )
 
     # persist raw bytes immediately so subsequent requests can reference them
     session = SESSION_STORE.get(session_id)
-    if file.filename not in session.files:
-        session.files.append(file.filename)
-    session.file_contents[file.filename] = content
+    if file.filename:
+        if file.filename not in session.files:
+            session.files.append(file.filename)
+        session.file_contents[file.filename] = content
     SESSION_STORE.save(session_id)
 
     # schedule background processing
     def _process_upload(sid: str, fname: str, data: bytes) -> None:
+        sess = SESSION_STORE.get(sid)
         try:
             parsed = parse_document(fname, data)
             full_text = "\n".join(page.text for page in parsed.pages)
-            company_name = detect_company_name(full_text)
-            signature = detect_signature_or_seal(full_text)
+            # Use LLM to extract company name and industry for all file types
+            company_name = None
+            industry = None
+            try:
+                prompt_ci = (
+                    "请从下面的文本中提取公司全称和所属行业，并以JSON格式返回，示例：{\"company_name\": \"...\", \"industry\": \"...\"}。"
+                    + "\n\n" + full_text[:10000]
+                )
+                resp = call_text_llm(prompt_ci)
+                # try to parse JSON from response
+                parsed_json = None
+                try:
+                    parsed_json = json.loads(resp)
+                except Exception:
+                    # attempt to find JSON substring
+                    start = resp.find("{")
+                    end = resp.rfind("}")
+                    if start != -1 and end != -1:
+                        try:
+                            parsed_json = json.loads(resp[start:end+1])
+                        except Exception:
+                            parsed_json = None
+
+                if isinstance(parsed_json, dict):
+                    company_name = parsed_json.get("company_name") or parsed_json.get("company")
+                    industry = parsed_json.get("industry")
+            except Exception:
+                company_name = None
+
+            # fallback heuristics
+            if not company_name:
+                company_name = detect_company_name(full_text)
+            if not industry:
+                industry = detect_industry(full_text)
+
+            # signature: prefer visual check for PDFs using VLM across all pages
+            signature = False
+            signature_note = None
+            try:
+                if fname.lower().endswith(".pdf"):
+                    try:
+                        signature, signature_note = detect_signature_in_pdf(data, len(parsed.pages))
+                    except Exception:
+                        signature = detect_signature_or_seal(full_text)
+                        signature_note = None
+                else:
+                    # non-pdf fallback: use text-based detection
+                    signature = detect_signature_or_seal(full_text)
+                    signature_note = None
+            except Exception:
+                signature = detect_signature_or_seal(full_text)
+                signature_note = None
+
+            # Detect additional metadata
+            company_size = detect_company_size(full_text)
+            region = detect_region(full_text)
+            target = detect_target(full_text)
 
             # If company name not found by regex, ask LLM to extract it (background only)
             if not company_name:
@@ -120,66 +185,76 @@ async def upload_file(
                 except Exception:
                     pass
 
+            report_type = detect_report_type(full_text)
+
             compliance = ComplianceResult(
                 is_supported=True,
                 company_name=company_name,
                 company_name_ok=bool(company_name),
                 has_signature_or_seal=signature,
+                report_type=report_type,
                 notes=[],
             )
 
             # persist compliance into session store for retrieval/debugging
-            SESSION_STORE.get(sid).file_compliance[fname] = {
+            sess = SESSION_STORE.get(sid)
+            sess.file_compliance[fname] = {
                 "is_supported": compliance.is_supported,
                 "company_name": compliance.company_name,
                 "company_name_ok": compliance.company_name_ok,
                 "has_signature_or_seal": compliance.has_signature_or_seal,
+                "report_type": compliance.report_type,
+                "industry": industry,
+                "company_size": company_size,
+                "region": region,
+                "target": target,
+                "signature_note": signature_note,
                 "notes": compliance.notes,
             }
 
-            sess = SESSION_STORE.get(sid)
             page_summaries: List[PageSummary] = []
-            docs: List[Document] = []
+
+            # Ensure the session has a place to store per-file page summaries
+            sess.page_summaries.setdefault(parsed.filename, {})
+
+            # 1. First, generate quick page summaries for the UI
             for page in parsed.pages:
                 summary = summarize_page(page.text)
                 page_summaries.append(PageSummary(page_number=page.page_number, summary=summary))
                 sess.page_summaries[parsed.filename][page.page_number] = summary
+            
+            SESSION_STORE.save(sid)
 
+            # 2. Embedding / indexing: use general page-level indexing via `add_documents`.
+            docs: List[Document] = []
+            for page in parsed.pages:
                 docs.append(
                     Document(
                         page_content=page.text,
                         metadata={
                             "filename": parsed.filename,
                             "page_number": page.page_number,
-                            "summary": summary,
+                            "summary": sess.page_summaries[parsed.filename].get(page.page_number, ""),
                         },
                     )
                 )
-            # attempt to add documents to vectorstore; on failure, log and continue
-            try:
-                add_documents(sess, docs)
-                SESSION_STORE.save(sid)
-            except Exception:
-                import traceback
+            add_documents(sess, docs)
 
-                traceback.print_exc()
-                # record a note so clients can see embedding/indexing failed
-                sess.file_compliance[fname] = sess.file_compliance.get(fname, {})
-                sess.file_compliance[fname]["notes"] = ["indexing_failed"]
+            SESSION_STORE.save(sid)
         except Exception:
-            # background errors should not crash the server; log to stdout for now
             import traceback
-
             traceback.print_exc()
+            # reload session to avoid stale data
+            sess = SESSION_STORE.get(sid)
+            # record a note so clients can see embedding/indexing failed
+            sess.file_compliance[fname] = sess.file_compliance.get(fname, {})
+            sess.file_compliance[fname]["notes"] = ["processing_failed"]
+            SESSION_STORE.save(sid)
 
-    if background_tasks is not None:
-        background_tasks.add_task(_process_upload, session_id, file.filename, content)
-    else:
-        # fallback: run synchronously if BackgroundTasks not provided
-        _process_upload(session_id, file.filename, content)
+    background_tasks.add_task(_process_upload, session_id, str(file.filename or ""), content)
 
     compliance = ComplianceResult(is_supported=True, notes=["processing"])
-    return DocumentIngestion(filename=file.filename, page_summaries=[], compliance=compliance)
+    return DocumentIngestion(filename=str(file.filename or ""), page_summaries=[], compliance=compliance)
 
 
 def best_source(docs: List[Document]) -> AnswerSource | None:
@@ -252,13 +327,14 @@ async def ask_questions(payload: QuestionRequest) -> QuestionResponse:
             if target_filename and target_filename.lower().endswith(".pdf"):
                 pdf_bytes = session.file_contents.get(target_filename)
                 if pdf_bytes:
-                    image_path = Path("/tmp") / f"{uuid.uuid4()}-page-{target_page}.jpg"
-                    render_pdf_page_to_jpg(pdf_bytes, target_page, image_path)
+                    tp = int(target_page or 1)
+                    image_path = Path("/tmp") / f"{uuid.uuid4()}-page-{tp}.jpg"
+                    render_pdf_page_to_jpg(pdf_bytes, tp, image_path)
                     try:
                         vl_answer = call_vl_llm(image_path, question)
                         # Only append if VL actually found something useful and doesn't contradict a strong text answer
                         if vl_answer and "未找到" not in vl_answer and "无法确定" not in vl_answer:
-                            answer_text = f"{answer_text}\n\n(视觉核对结果 [第{target_page}页]: {vl_answer})"
+                            answer_text = f"{answer_text}\n\n(视觉核对结果 [第{tp}页]: {vl_answer})"
                     except QwenConfigError:
                         pass
 
@@ -292,10 +368,82 @@ async def ask_questions(payload: QuestionRequest) -> QuestionResponse:
         )
     SESSION_STORE.save_rag_answers(payload.session_id, stored_answers)
 
+
+    # Persist answers into session.rag_answers so frontend can display suggestions.
+    # Mapping strategy:
+    # 1) If client provided explicit `keys` (backwards-compatible), use them.
+    # 2) If session.questionnaire exists and lengths match, map by index.
+    # 3) Try exact question-text matching.
+    # 4) Fallback to generated keys `rag_auto_N`.
+    try:
+        keys = getattr(payload, "keys", None)
+        if isinstance(keys, list) and len(keys) == len(answers):
+            for i, k in enumerate(keys):
+                key = str(k)
+                ans = answers[i]
+                session.rag_answers[key] = {
+                    "answer": ans.answer,
+                    "extracted_answer": ans.extracted_answer,
+                    "summary": ans.summary,
+                    "sources": [
+                        {"filename": src.filename, "page_number": src.page_number, "summary": src.summary}
+                        for src in ans.sources
+                    ],
+                }
+        else:
+            q_items = session.questionnaire or []
+            if q_items and len(q_items) == len(answers):
+                for i, item in enumerate(q_items):
+                    key = str(item.get("key") or f"q_{i}")
+                    ans = answers[i]
+                    session.rag_answers[key] = {
+                        "answer": ans.answer,
+                        "extracted_answer": ans.extracted_answer,
+                        "summary": ans.summary,
+                        "sources": [
+                            {"filename": src.filename, "page_number": src.page_number, "summary": src.summary}
+                            for src in ans.sources
+                        ],
+                    }
+            else:
+                for ans in answers:
+                    mapped = False
+                    for item in session.questionnaire or []:
+                        q_text = item.get("question")
+                        if isinstance(q_text, str) and isinstance(ans.question, str) and ans.question.strip() == q_text.strip():
+                            key = str(item.get("key") or q_text)
+                            session.rag_answers[key] = {
+                                "answer": ans.answer,
+                                "extracted_answer": ans.extracted_answer,
+                                "summary": ans.summary,
+                                "sources": [
+                                    {"filename": src.filename, "page_number": src.page_number, "summary": src.summary}
+                                    for src in ans.sources
+                                ],
+                            }
+                            mapped = True
+                            break
+                    if not mapped:
+                        gen_key = f"rag_auto_{len(session.rag_answers)}"
+                        session.rag_answers[gen_key] = {
+                            "question": ans.question,
+                            "answer": ans.answer,
+                            "extracted_answer": ans.extracted_answer,
+                            "summary": ans.summary,
+                            "sources": [
+                                {"filename": src.filename, "page_number": src.page_number, "summary": src.summary}
+                                for src in ans.sources
+                            ],
+                        }
+        SESSION_STORE.save(payload.session_id)
+    except Exception:
+        # Don't let persistence failures break the response; just continue
+        pass
+
     return QuestionResponse(session_id=payload.session_id, answers=answers)
 
 
-@app.post("questionnaire/parse", response_model=QuestionnaireResponse)
+@app.post("/questionnaire/parse", response_model=QuestionnaireResponse)
 async def parse_questionnaire_api(file: UploadFile = File(...)) -> QuestionnaireResponse:
     """
     Standalone API to convert an attached file (PDF, DOCX, TXT, MD) into a structured ESG questionnaire.
@@ -304,7 +452,7 @@ async def parse_questionnaire_api(file: UploadFile = File(...)) -> Questionnaire
     """
     content = await file.read()
     try:
-        parsed = parse_document(file.filename, content)
+        parsed = parse_document(str(file.filename or ""), content)
         text = "\n".join(page.text for page in parsed.pages)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
@@ -341,11 +489,11 @@ async def parse_questionnaire_api(file: UploadFile = File(...)) -> Questionnaire
         if not isinstance(items, list):
             raise ValueError("LLM did not return a list")
             
-        return QuestionnaireResponse(items=items)
+        return QuestionnaireResponse(items=items)  # type: ignore[arg-type]
     except Exception:
         # Fallback to regex parser if LLM fails (only works well for MD/TXT)
         items = parse_questionnaire(text)
-        return QuestionnaireResponse(items=items)
+        return QuestionnaireResponse(items=items)  # type: ignore[arg-type]
 
 
 @app.post("/session/{session_id}/questionnaire/upload-markdown")
@@ -404,7 +552,6 @@ def get_session_status(session_id: str) -> dict:
         "has_vectorstore": session.vectorstore is not None,
     }
 
-
 @app.get("/session/{session_id}/rag-ready")
 def get_rag_ready(session_id: str) -> dict:
     """Return whether the RAG/vectorstore for the given session is ready.
@@ -435,3 +582,38 @@ def update_file_compliance(session_id: str, filename: str, payload: dict = Body(
     session.file_compliance[filename] = payload
     SESSION_STORE.save(session_id)
     return session.file_compliance[filename]
+
+
+@app.post("/compliance/detect-signature")
+async def detect_signature_uploaded_file(file: UploadFile = File(...)) -> dict:
+    """Explicitly detect signature/seal in an uploaded file."""
+    content = await file.read()
+    filename = str(file.filename or "uploaded_file")
+    suffix = Path(filename).suffix.lower()
+    
+    try:
+        signature = False
+        signature_note = None
+        
+        if suffix == ".pdf":
+            # We need page count, but avoid full text parsing
+            num_pages = get_pdf_page_count(content)
+            signature, signature_note = detect_signature_in_pdf(content, num_pages)
+        elif suffix in [".jpg", ".jpeg", ".png", ".bmp"]:
+            signature, signature_note = detect_signature_in_image(content)
+        else:
+            # Fallback for docx/txt
+            parsed = parse_document(filename, content)
+            full_text = "\n".join(page.text for page in parsed.pages)
+            signature = detect_signature_or_seal(full_text)
+            signature_note = "Text-based detection" if signature else "No keywords found"
+
+        return {
+            "filename": filename,
+            "has_signature_or_seal": signature,
+            "signature_note": signature_note
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
