@@ -6,7 +6,8 @@ import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Any, Sequence
+from typing import Dict, List, Any, Sequence, Optional
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import mysql.connector
@@ -28,6 +29,7 @@ class SessionData:
     questionnaire: List[Dict[str, Any]] = field(default_factory=list)
     rag_answers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     readme: str = ""
+    faiss_last_updated: Optional[str] = None
 
 
 class SessionStore:
@@ -222,6 +224,11 @@ class SessionStore:
         # Save FAISS
         if sess.vectorstore:
             sess.vectorstore.save_local(str(storage_path / "faiss"))
+            # Record last-updated time based on index file modification time if available
+            faiss_index = storage_path / "faiss" / "index.faiss"
+            if faiss_index.exists():
+                mtime = datetime.fromtimestamp(faiss_index.stat().st_mtime, tz=timezone.utc)
+                sess.faiss_last_updated = mtime.isoformat()
 
         # Save large binary files to disk
         files_dir = storage_path / "files"
@@ -242,6 +249,7 @@ class SessionStore:
             "questionnaire": sess.questionnaire,
             "rag_answers": sess.rag_answers,
             "readme": sess.readme,
+            "faiss_last_updated": sess.faiss_last_updated,
         }
         serialized = json.dumps(metadata, ensure_ascii=False)
 
@@ -290,6 +298,13 @@ class SessionStore:
                     build_embeddings(),
                     allow_dangerous_deserialization=True,
                 )
+                # Set last-updated timestamp from file modification time
+                faiss_index = faiss_path / "index.faiss"
+                try:
+                    mtime = datetime.fromtimestamp(faiss_index.stat().st_mtime, tz=timezone.utc)
+                    sess.faiss_last_updated = mtime.isoformat()
+                except Exception:
+                    sess.faiss_last_updated = None
 
             files_dir = storage_path / "files"
             if files_dir.exists():

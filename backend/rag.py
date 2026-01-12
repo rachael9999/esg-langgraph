@@ -34,7 +34,7 @@ def add_documents(session: SessionData, docs: List[Document]) -> None:
 
 def rewrite_question(state: RagState) -> RagState:
     question = state["question"].strip()
-    prompt = f"请改写问题，使其更适合基于公司文件检索：{question}"
+    prompt = f"请改写问题，使其更适合基于公司文件检索：{question}, 对于范围一二三排放优先使用市场基础法（market based）计算，请将此条写入优化后的问题中，如果有绿点抵消，比如碳汇或碳信用额度，也请在问题中体现。"
     try:
         rewritten = call_text_llm(prompt)
     except QwenConfigError:
