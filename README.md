@@ -1,9 +1,0 @@
-# ESG LangGraph
-
-This repository contains a backend FastAPI service and a Streamlit frontend for document-based ESG question answering, plus utilities for RAG and basic LLM calls.
-
-Files added from patch include backend/ and frontend/ modules and a requirements.txt.
-
-## Session persistence
-
-Session metadata is persisted via a relational database. Set the `SESSION_DB_URL` environment variable to a MySQL connection string (e.g., `mysql://esg_user:secret@127.0.0.1:3306/esg_langgraph`). When the variable is unset, the service falls back to a local SQLite file for convenience, but specifying a MySQL URL ensures the backend does not need SQLite initialized.

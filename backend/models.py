@@ -17,17 +17,6 @@ class ComplianceResult(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
-class PageSummary(BaseModel):
-    page_number: int
-    summary: str
-
-
-class DocumentIngestion(BaseModel):
-    filename: str
-    page_summaries: list[PageSummary]
-    compliance: ComplianceResult
-
-
 class QuestionRequest(BaseModel):
     session_id: str
     questions: list[str]
@@ -46,23 +35,3 @@ class AnswerItem(BaseModel):
     extracted_answer: str | None = None
     sources: list[AnswerSource]
     summary: str | None = None
-
-
-class QuestionResponse(BaseModel):
-    session_id: str
-    answers: list[AnswerItem]
-
-
-class QuestionnaireItem(BaseModel):
-    key: str
-    type: str
-    question: str
-    options: list[str] | None = None
-
-
-class QuestionnaireResponse(BaseModel):
-    items: list[QuestionnaireItem]
-
-
-class ReadmeRequest(BaseModel):
-    content: str

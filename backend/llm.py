@@ -144,27 +144,17 @@ def call_text_llm(prompt: str, system_prompt: str | None = None) -> str:
     messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
     return _post_chat({"model": TEXT_MODEL, "messages": messages, "temperature": 0.2})
 
-
-def call_vl_llm(image_path: Path, question: str) -> str:
-    encoded = base64.b64encode(image_path.read_bytes()).decode("utf-8")
-    prompt = (
-        f"请根据提供的图片回答问题：{question}\n"
-        "要求：\n"
-        "1. 如果图片中包含该问题的直接数值或答案，请提取出来并给出简短说明。\n"
-        "2. 如果图片中完全没有提到该问题相关的信息，请只返回 '未找到相关内容'，不要解释。\n"
-        "3. 回答要简洁，不要重复图片中无关的背景信息。"
-    )
+def call_vl_llm(image_b64: str, prompt: str) -> str:
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
-            ],
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": prompt}
+            ]
         }
     ]
-    return _post_chat({"model": VL_MODEL, "messages": messages, "temperature": 0.2})
-
+    return _post_chat({"model": VL_MODEL, "messages": messages, "temperature": 0.1})
 
 def summarize_page(text: str) -> str:
     prompt = (

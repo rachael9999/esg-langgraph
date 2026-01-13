@@ -6,10 +6,10 @@ from typing import Iterable, List, Optional, TypedDict
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph, END
+import faiss
 
-from .llm import call_text_llm, call_embedding, build_embeddings, QwenConfigError
+from .llm import call_text_llm, call_embedding, build_embeddings, QwenConfigError, EMBED_DIM
 from .session_store import SessionData
 
 
@@ -23,13 +23,52 @@ class RagState(TypedDict):
 
 def ensure_vectorstore(session: SessionData) -> FAISS:
     if session.vectorstore is None:
-        session.vectorstore = FAISS.from_texts(["ESG Assistant Initialized"], embedding=build_embeddings())
+        # Create compressed FAISS index using IVF-PQ
+        d = EMBED_DIM  # dimension, e.g., 1536
+        nlist = 100  # number of clusters for IVF
+        m = 16  # number of sub-quantizers for PQ (d must be divisible by m)
+        nbits = 8  # bits per sub-vector (2^8 = 256 centroids per sub-vector)
+        
+        # Use Inner Product (cosine similarity)
+        quantizer = faiss.IndexFlatIP(d)
+        index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)
+        
+        # Initialize the index (train on dummy data if needed, but FAISS handles it)
+        # For PQ, we need to train, but for simplicity, assume embeddings are added later
+        
+        session.vectorstore = FAISS(build_embeddings(), index=index, docstore={}, index_to_docstore_id={})
     return session.vectorstore
 
 
 def add_documents(session: SessionData, docs: List[Document]) -> None:
     vectorstore = ensure_vectorstore(session)
-    vectorstore.add_documents(docs)
+    
+    # Get embeddings for the documents
+    embeddings = build_embeddings()
+    texts = [doc.page_content for doc in docs]
+    vectors = embeddings.embed_documents(texts)
+    
+    # Convert to numpy array
+    import numpy as np
+    vectors_np = np.array(vectors, dtype=np.float32)
+    
+    # Train the index if not trained
+    if not vectorstore.index.is_trained:
+        vectorstore.index.train(vectors_np)
+    
+    # Add vectors to the index
+    ids = vectorstore.index.add(vectors_np)
+    
+    # Update docstore and index_to_docstore_id
+    for doc, doc_id in zip(docs, ids):
+        doc_id_str = str(doc_id)
+        vectorstore.docstore[doc_id_str] = doc
+        vectorstore.index_to_docstore_id[doc_id] = doc_id_str
+        
+        # Save vector_id to doc metadata
+        if doc.metadata is None:
+            doc.metadata = {}
+        doc.metadata["vector_id"] = doc_id_str
 
 
 def rewrite_question(state: RagState) -> RagState:
@@ -128,7 +167,6 @@ def build_rag_graph() -> StateGraph:
 
     graph = StateGraph(RagState)
     graph.add_node("rewrite_query", rewrite_question)
-    # The second argument to a node function is the config dictionary
     graph.add_node("retrieve_docs", lambda state, config: retrieve_docs(state, config["configurable"]["vectorstore"]))
     graph.add_node("generate_answer", answer_question)
     graph.add_node("generate_input", generate_input)
@@ -248,3 +286,61 @@ def is_numeric_question(question: str) -> bool:
     if any(keyword in question for keyword in keywords):
         return True
     return bool(re.search(r"\d", question))
+
+
+def delete_documents_by_filename(session: SessionData, filename: str) -> None:
+    """Delete documents from vectorstore by filename."""
+    from .database import SessionLocal, DBDocument
+    from .session_store import SESSION_STORE
+    import json
+    
+    db = SessionLocal()
+    try:
+        doc_record = db.query(DBDocument).filter(
+            DBDocument.session_id == session.session_id,
+            DBDocument.filename == filename
+        ).first()
+        
+        if doc_record and doc_record.vector_ids:
+            vector_ids = json.loads(doc_record.vector_ids)
+            vectorstore = ensure_vectorstore(session)
+            vectorstore.delete(vector_ids)
+            SESSION_STORE.save_vectorstore(session)
+        
+        # Remove from DB
+        if doc_record:
+            db.delete(doc_record)
+            db.commit()
+    finally:
+        db.close()
+    """Rebuild the vectorstore for the session, excluding documents with the given filename."""
+    from .database import SessionLocal, DBDocument
+    from .utils import parse_document, summarize_page
+    from .session_store import SESSION_STORE
+    
+    db = SessionLocal()
+    try:
+        docs = db.query(DBDocument).filter(DBDocument.session_id == session.session_id).all()
+        
+        # Create new vectorstore
+        embeddings = build_embeddings()
+        new_vectorstore = FAISS.from_texts(["ESG Assistant Initialized"], embedding=embeddings)
+        
+        for doc_record in docs:
+            if doc_record.filename == exclude_filename:
+                continue  # Skip the excluded file
+            
+
+            pass
+
+        if docs and any(d.filename != exclude_filename for d in docs):
+
+            print(f"Warning: Cannot rebuild vectorstore without original file contents. Removing {exclude_filename} from records only.")
+            session.vectorstore = None  # Force reload or something
+        else:
+            session.vectorstore = new_vectorstore
+        
+        SESSION_STORE.save_vectorstore(session)
+        
+    finally:
+        db.close()
