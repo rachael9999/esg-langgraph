@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Migrate sessions.db metadata to minimal FAISS-only format.
+"""Migrate sessions.db metadata to minimal Qdrant-only format.
 
 This script creates a backup of `sessions.db` and updates every session's
-`metadata` column to a JSON object containing only `faiss_last_updated`.
-It will try to infer `faiss_last_updated` from the stored FAISS index
-file modification time under `storage/<session_id>/faiss/index.faiss`.
+`metadata` column to a JSON object containing only `qdrant_last_updated`.
+It will try to infer `qdrant_last_updated` from the local Qdrant storage
+directory modification time under `storage/<session_id>/qdrant`.
 """
 from __future__ import annotations
 
@@ -20,11 +20,11 @@ DB_PATH = ROOT / "sessions.db"
 STORAGE_DIR = ROOT / "storage"
 
 
-def infer_faiss_mtime(session_id: str) -> Optional[str]:
-    faiss_index = STORAGE_DIR / session_id / "faiss" / "index.faiss"
-    if faiss_index.exists():
+def infer_qdrant_mtime(session_id: str) -> Optional[str]:
+    qdrant_dir = STORAGE_DIR / session_id / "qdrant"
+    if qdrant_dir.exists():
         try:
-            mtime = datetime.fromtimestamp(faiss_index.stat().st_mtime, tz=timezone.utc)
+            mtime = datetime.fromtimestamp(qdrant_dir.stat().st_mtime, tz=timezone.utc)
             return mtime.isoformat()
         except Exception:
             return None
@@ -60,9 +60,9 @@ def migrate():
         except Exception:
             meta = {}
 
-        faiss_last = meta.get("faiss_last_updated") or infer_faiss_mtime(session_id)
+        qdrant_last = meta.get("qdrant_last_updated") or infer_qdrant_mtime(session_id)
 
-        new_meta = {"faiss_last_updated": faiss_last}
+        new_meta = {"qdrant_last_updated": qdrant_last}
         new_serial = json.dumps(new_meta, ensure_ascii=False)
 
         if new_serial != (metadata_json or ""):

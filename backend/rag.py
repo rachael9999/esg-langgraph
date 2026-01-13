@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Iterable, List, Optional, TypedDict
 
 from langchain_core.documents import Document
-from langchain_community.vectorstores import FAISS
-from langchain_core.embeddings import Embeddings
+from langchain_community.vectorstores import Qdrant
 from langgraph.graph import StateGraph, END
-import faiss
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
 
-from .llm import call_text_llm, call_embedding, build_embeddings, QwenConfigError, EMBED_DIM
+from .llm import call_text_llm, build_embeddings, QwenConfigError, EMBED_DIM
 from .session_store import SessionData
 
 
@@ -21,51 +22,33 @@ class RagState(TypedDict):
     extracted_answer: Optional[str]
 
 
-def ensure_vectorstore(session: SessionData) -> FAISS:
+def ensure_vectorstore(session: SessionData) -> Qdrant:
     if session.vectorstore is None:
-        # Create compressed FAISS index using IVF-PQ
-        d = EMBED_DIM  # dimension, e.g., 1536
-        nlist = 100  # number of clusters for IVF
-        m = 16  # number of sub-quantizers for PQ (d must be divisible by m)
-        nbits = 8  # bits per sub-vector (2^8 = 256 centroids per sub-vector)
-        
-        # Use Inner Product (cosine similarity)
-        quantizer = faiss.IndexFlatIP(d)
-        index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)
-        
-        # Initialize the index (train on dummy data if needed, but FAISS handles it)
-        # For PQ, we need to train, but for simplicity, assume embeddings are added later
-        
-        session.vectorstore = FAISS(build_embeddings(), index=index, docstore={}, index_to_docstore_id={})
+        base_path = os.path.join("storage", session.session_id, "qdrant")
+        os.makedirs(base_path, exist_ok=True)
+        client = QdrantClient(path=base_path)
+        collection_name = "documents"
+        if collection_name not in {c.name for c in client.get_collections().collections}:
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=qdrant_models.VectorParams(
+                    size=EMBED_DIM,
+                    distance=qdrant_models.Distance.COSINE,
+                ),
+            )
+        session.vectorstore = Qdrant(
+            client=client,
+            collection_name=collection_name,
+            embeddings=build_embeddings(),
+        )
     return session.vectorstore
 
 
 def add_documents(session: SessionData, docs: List[Document]) -> None:
     vectorstore = ensure_vectorstore(session)
-    
-    # Get embeddings for the documents
-    embeddings = build_embeddings()
-    texts = [doc.page_content for doc in docs]
-    vectors = embeddings.embed_documents(texts)
-    
-    # Convert to numpy array
-    import numpy as np
-    vectors_np = np.array(vectors, dtype=np.float32)
-    
-    # Train the index if not trained
-    if not vectorstore.index.is_trained:
-        vectorstore.index.train(vectors_np)
-    
-    # Add vectors to the index
-    ids = vectorstore.index.add(vectors_np)
-    
-    # Update docstore and index_to_docstore_id
+    ids = vectorstore.add_documents(docs)
     for doc, doc_id in zip(docs, ids):
         doc_id_str = str(doc_id)
-        vectorstore.docstore[doc_id_str] = doc
-        vectorstore.index_to_docstore_id[doc_id] = doc_id_str
-        
-        # Save vector_id to doc metadata
         if doc.metadata is None:
             doc.metadata = {}
         doc.metadata["vector_id"] = doc_id_str
@@ -87,7 +70,7 @@ def rewrite_question(state: RagState) -> RagState:
     }
 
 
-def retrieve_docs(state: RagState, vectorstore: FAISS) -> RagState:
+def retrieve_docs(state: RagState, vectorstore: Qdrant) -> RagState:
     query = state.get("rewritten_question") or state["question"]
     docs = vectorstore.similarity_search(query, k=4)
     return {
@@ -301,46 +284,28 @@ def delete_documents_by_filename(session: SessionData, filename: str) -> None:
             DBDocument.filename == filename
         ).first()
         
-        if doc_record and doc_record.vector_ids:
-            vector_ids = json.loads(doc_record.vector_ids)
+        if doc_record:
             vectorstore = ensure_vectorstore(session)
-            vectorstore.delete(vector_ids)
+            vector_ids = json.loads(doc_record.vector_ids) if doc_record.vector_ids else []
+            if vector_ids:
+                vectorstore.delete(vector_ids)
+            else:
+                vectorstore.client.delete(
+                    collection_name=vectorstore.collection_name,
+                    points_selector=qdrant_models.Filter(
+                        must=[
+                            qdrant_models.FieldCondition(
+                                key="metadata.filename",
+                                match=qdrant_models.MatchValue(value=filename),
+                            )
+                        ]
+                    ),
+                )
             SESSION_STORE.save_vectorstore(session)
         
         # Remove from DB
         if doc_record:
             db.delete(doc_record)
             db.commit()
-    finally:
-        db.close()
-    """Rebuild the vectorstore for the session, excluding documents with the given filename."""
-    from .database import SessionLocal, DBDocument
-    from .utils import parse_document, summarize_page
-    from .session_store import SESSION_STORE
-    
-    db = SessionLocal()
-    try:
-        docs = db.query(DBDocument).filter(DBDocument.session_id == session.session_id).all()
-        
-        # Create new vectorstore
-        embeddings = build_embeddings()
-        new_vectorstore = FAISS.from_texts(["ESG Assistant Initialized"], embedding=embeddings)
-        
-        for doc_record in docs:
-            if doc_record.filename == exclude_filename:
-                continue  # Skip the excluded file
-            
-
-            pass
-
-        if docs and any(d.filename != exclude_filename for d in docs):
-
-            print(f"Warning: Cannot rebuild vectorstore without original file contents. Removing {exclude_filename} from records only.")
-            session.vectorstore = None  # Force reload or something
-        else:
-            session.vectorstore = new_vectorstore
-        
-        SESSION_STORE.save_vectorstore(session)
-        
     finally:
         db.close()

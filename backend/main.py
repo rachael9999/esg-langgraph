@@ -52,7 +52,7 @@ async def upload_and_index(
     """
     Step 1: Save the file.
     Step 2: Parse and summarize pages.
-    Step 3: Index into FAISS immediately.
+    Step 3: Index into Qdrant immediately.
     """
     content = await file.read()
     filename = str(file.filename or "unknown")
@@ -82,7 +82,7 @@ async def upload_and_index(
                 )
             )
 
-        # Add to FAISS (session holds only vectorstore/faiss metadata)
+        # Add to Qdrant (session holds only vectorstore metadata)
         add_documents(session, docs)
 
         # Collect vector IDs from docs metadata
