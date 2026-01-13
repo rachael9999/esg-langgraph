@@ -4,14 +4,17 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Dict
 
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Qdrant
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
 
 from .database import SessionLocal, DBSession, DBDocument
+from .llm import EMBED_DIM, build_embeddings
 
 @dataclass
 class SessionData:
     session_id: str
-    vectorstore: Optional[FAISS] = None
+    vectorstore: Optional[Qdrant] = None
 
 class SessionStore:
     def __init__(self):
@@ -43,30 +46,28 @@ class SessionStore:
         self._cache[session_id] = session
         return session
 
-    def _load_vectorstore(self, session_id: str) -> Optional[FAISS]:
-        from .llm import build_embeddings
-        
-        # Determine path (mirroring the path logic used elsewhere)
-        # Based on file listing: storage/<uuid>/faiss/index.faiss
-        base_path = os.path.join("storage", session_id, "faiss")
-        
-        if os.path.exists(base_path) and os.path.exists(os.path.join(base_path, "index.faiss")):
-            try:
-                embeddings = build_embeddings()
-                return FAISS.load_local(base_path, embeddings, allow_dangerous_deserialization=True)
-            except Exception as e:
-                print(f"Error loading FAISS index for {session_id}: {e}")
-                return None
-        return None
+    def _load_vectorstore(self, session_id: str) -> Optional[Qdrant]:
+        base_path = os.path.join("storage", session_id, "qdrant")
+        os.makedirs(base_path, exist_ok=True)
+        client = QdrantClient(path=base_path)
+        collection_name = "documents"
+
+        if collection_name not in {c.name for c in client.get_collections().collections}:
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=qdrant_models.VectorParams(
+                    size=EMBED_DIM,
+                    distance=qdrant_models.Distance.COSINE,
+                ),
+            )
+
+        embeddings = build_embeddings()
+        return Qdrant(client=client, collection_name=collection_name, embeddings=embeddings)
 
     def save_vectorstore(self, session: SessionData):
-        """Save the session's FAISS index to disk."""
+        """No-op for Qdrant local storage (persisted automatically)."""
         if not session.vectorstore:
             return
-        
-        base_path = os.path.join("storage", session.session_id, "faiss")
-        os.makedirs(base_path, exist_ok=True)
-        session.vectorstore.save_local(base_path)
 
     def add_document_record(self, session_id: str, filename: str, page_count: int, summary: Optional[str] = None, vector_ids: Optional[list[str]] = None):
         """Add a record of the uploaded document to MySQL."""
